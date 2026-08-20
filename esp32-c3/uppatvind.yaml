@@ -1,0 +1,335 @@
+# IKEA UPPÅTVIND as a proper Home Assistant fan entity, on an ESP32-C3.
+#
+# Wiring (all UPPÅTVIND test pads are 5 V — the C3 is NOT 5 V tolerant,
+# so both signals go through a BSS138 level shifter, see README.md):
+#   TP2 (GND)      -> GND
+#   TP3 (5 V)      -> 5V pin (the SuperMini has its own regulator)
+#   TP4 (button)   -> GPIO3 via level shifter (open drain)
+#   TP7 (LED1 PWM) -> GPIO4 via level shifter
+#
+# The purifier's own MCU cycles off->1->2->3 on each button press. We fake
+# presses and read the real speed back from the PWM duty cycle on LED1.
+# Holding the button for ~2 s powers off directly, without cycling.
+#
+# Duty thresholds below were measured on real hardware, see README.md.
+esphome:
+  name: uppatvind
+  friendly_name: UPPÅTVIND
+
+esp32:
+  board: esp32-c3-devkitm-1
+  framework:
+    type: esp-idf
+
+# C3 SuperMini: logs go over native USB-CDC. Without this they end up on
+# UART0 (the physical TX pin) and the USB console stays silent.
+logger:
+  hardware_uart: USB_SERIAL_JTAG
+
+api:
+  encryption:
+    key: !secret api_encryption_key
+
+ota:
+  - platform: esphome
+    password: !secret ota_password
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  # Optional but recommended: mDNS tends to be flaky, a fixed address keeps
+  # OTA and logs reachable. Adjust to your own subnet, or drop the block and
+  # use a DHCP reservation instead.
+  # manual_ip:
+  #   static_ip: 192.168.1.50
+  #   gateway: 192.168.1.1
+  #   subnet: 255.255.255.0
+  #   dns1: 192.168.1.1
+  ap:
+    ssid: "Uppatvind Fallback"
+    password: !secret ota_password
+
+captive_portal:
+
+# The button line is driven open drain: pulled low means "pressed", released
+# means high-Z. dummy_fan_output is a stub — the purifier's own MCU drives the
+# motor, we only emulate button presses.
+output:
+  - platform: gpio
+    id: button_out
+    pin:
+      number: GPIO3
+      inverted: true
+      mode:
+        output: true
+        open_drain: true
+  - platform: template
+    id: dummy_fan_output
+    type: float
+    write_action:
+      - lambda: ";"
+
+globals:
+  # What the hardware actually does, as read back from LED1.
+  - id: current_speed
+    type: int
+    initial_value: "0"
+  # True while a press sequence is running. The duty sensor stays quiet then:
+  # mid-sequence readings are not a speed the user asked for.
+  - id: adjusting
+    type: bool
+    initial_value: "false"
+  # Debounce. LED1 fades in over ~2 s, so intermediate duty readings
+  # (0.7 / 13.6 / 17.8 / 77.9 %) are the fade, not a speed. Only accept a
+  # value seen twice in a row.
+  - id: pending_speed
+    type: int
+    initial_value: "-1"
+  - id: pending_count
+    type: int
+    initial_value: "0"
+  - id: retries
+    type: int
+    initial_value: "0"
+  # Where we want to end up. Fan triggers only write here; the go_to_speed
+  # loop re-reads it every iteration, so a command that arrives mid-sequence
+  # (where script.execute is dropped by mode: single) is not lost.
+  - id: desired_speed
+    type: int
+    initial_value: "0"
+  # Target of the current attempt — desired_speed may change halfway through.
+  - id: attempt_target
+    type: int
+    initial_value: "0"
+  # True while the sensor itself calls fan.make_call(). That call fires the
+  # very same on_speed_set / on_turn_* triggers, so without this flag the
+  # state sync would overwrite a command that just arrived from HA.
+  - id: syncing
+    type: bool
+    initial_value: "false"
+  - id: script_running
+    type: bool
+    initial_value: "false"
+  # Target we gave up on after 3 attempts, so the watchdog below does not
+  # hammer the button forever when the hardware does not respond.
+  - id: give_up_target
+    type: int
+    initial_value: "-1"
+  # Where the presses made so far have left us. While adjusting is true the
+  # sensor is muted and current_speed is stale, but the intermediate state is
+  # deterministic: every press is (speed + 1) % 4. So the target can be
+  # re-checked after each press without waiting for LED1.
+  - id: virtual_speed
+    type: int
+    initial_value: "0"
+  # Safety stop: if HA floods commands, the inner loop must not spin forever.
+  - id: press_budget
+    type: int
+    initial_value: "0"
+
+script:
+  # A single press, exposed to HA for calibration.
+  # mode: queued so manual presses from the UI are never dropped.
+  - id: press_once
+    mode: queued
+    max_runs: 8
+    then:
+      - logger.log: "press_once: click"
+      - output.turn_on: button_out
+      - delay: 120ms
+      - output.turn_off: button_out
+      - delay: 400ms
+
+  # Drives the purifier to desired_speed, then verifies against the sensor and
+  # retries — a press the purifier missed would otherwise leave HA and the
+  # hardware in different states.
+  #
+  # mode: single is deliberate. One HA command fires both on_turn_on and
+  # on_speed_set, and the second execute must not restart a running sequence.
+  - id: go_to_speed
+    mode: single
+    then:
+      - lambda: "id(retries) = 0; id(script_running) = true;"
+      - while:
+          condition:
+            lambda: |-
+              return id(current_speed) != id(desired_speed) && id(retries) < 3;
+          then:
+            - lambda: |-
+                id(adjusting) = true;
+                id(retries) += 1;
+                id(virtual_speed) = id(current_speed);
+                id(press_budget) = 8;
+            - logger.log:
+                format: "go_to_speed: current=%d target=%d attempt %d"
+                args:
+                  - "id(current_speed)"
+                  - "id(desired_speed)"
+                  - "id(retries)"
+            # Press one at a time and re-check the target after every press.
+            # If the command changes mid-sequence we stop at the new target
+            # immediately instead of completing a full off->1->2->3 lap.
+            - while:
+                condition:
+                  lambda: |-
+                    return id(virtual_speed) != id(desired_speed)
+                           && id(press_budget) > 0
+                           && id(desired_speed) != 0;
+                then:
+                  - output.turn_on: button_out
+                  - delay: 120ms
+                  - output.turn_off: button_out
+                  - delay: 400ms
+                  - lambda: |-
+                      id(virtual_speed) = (id(virtual_speed) + 1) % 4;
+                      id(press_budget) -= 1;
+                  - logger.log:
+                      format: "  click -> %d"
+                      args: ["id(virtual_speed)"]
+            # Holding the button for ~2 s powers off directly (upstream #7).
+            # Otherwise turning off from speed 1 would mean 1->2->3->0, i.e.
+            # spinning the fan up to maximum first — slow and loud.
+            - if:
+                condition:
+                  lambda: "return id(desired_speed) == 0;"
+                then:
+                  - logger.log: "  long press -> 0"
+                  - output.turn_on: button_out
+                  - delay: 2s
+                  - output.turn_off: button_out
+                  - delay: 400ms
+                  - lambda: "id(virtual_speed) = 0;"
+            - lambda: "id(attempt_target) = id(virtual_speed);"
+            - delay: 1500ms # let LED1 catch up with the new speed
+            - lambda: "id(adjusting) = false;"
+            # Wait for the sensor to confirm, rather than a fixed delay.
+            # Debounce did not run at all while adjusting was true, so it
+            # needs 3 more samples (~3 s) afterwards. A shorter fixed delay
+            # made the loop re-read a stale current_speed and press again.
+            - wait_until:
+                condition:
+                  lambda: "return id(current_speed) == id(attempt_target);"
+                timeout: 6s
+            # Target moved while we were working: that is a new command, not
+            # a failed attempt, so give it a fresh retry budget.
+            - lambda: |-
+                if (id(desired_speed) != id(attempt_target)) id(retries) = 0;
+      - lambda: |-
+          id(script_running) = false;
+          if (id(current_speed) == id(desired_speed)) {
+            id(give_up_target) = -1;
+            return;
+          }
+          // Out of attempts, the hardware did not follow. Remember the target
+          // so the watchdog stops retrying, and roll the UI back to what the
+          // hardware actually does — a visible failure beats a lying UI.
+          id(give_up_target) = id(desired_speed);
+          id(desired_speed) = id(current_speed);
+          id(syncing) = true;
+          auto call = id(purifier).make_call();
+          if (id(current_speed) == 0) call.set_state(false);
+          else { call.set_state(true); call.set_speed(id(current_speed)); }
+          call.perform();
+          id(syncing) = false;
+
+# Real speed, read back from the PWM duty cycle on LED1.
+sensor:
+  - platform: duty_cycle
+    id: led1_duty
+    name: "LED1 duty"
+    pin: GPIO4
+    update_interval: 1s
+    on_value:
+      then:
+        - lambda: |-
+            if (id(adjusting)) return;  // press sequence still running
+            // Duty plateaus measured on real hardware:
+            // off = 0.0 %, 1 = 5.0 %, 2 = 25.0 %, 3 = 80.0 %.
+            // Thresholds sit halfway between them, never on them, so fade and
+            // jitter cannot flip the reported speed.
+            int spd;
+            if (x < 2.5) spd = 0;
+            else if (x < 15.0) spd = 1;
+            else if (x < 50.0) spd = 2;
+            else spd = 3;
+            if (spd != id(pending_speed)) {  // new value, start counting
+              id(pending_speed) = spd;
+              id(pending_count) = 1;
+              return;
+            }
+            if (id(pending_count) < 2) {  // not confirmed yet
+              id(pending_count) += 1;
+              return;
+            }
+            if (spd == id(current_speed)) return;
+            id(current_speed) = spd;
+            // Someone pressed the physical button: follow the hardware.
+            // Not while our own command runs though — there the target is ours.
+            if (!id(script_running)) id(desired_speed) = spd;
+            // While a command is in flight HA must keep showing the target,
+            // not an intermediate speed. Otherwise the sensor publishes the
+            // old speed into the gap between the command and the script
+            // starting, and the UI jumps back before settling.
+            if (id(script_running) || id(current_speed) != id(desired_speed))
+              return;
+            id(syncing) = true;
+            auto call = id(purifier).make_call();
+            if (spd == 0) call.set_state(false);
+            else { call.set_state(true); call.set_speed(spd); }
+            call.perform();
+            id(syncing) = false;
+  - platform: wifi_signal
+    name: "WiFi RSSI"
+    update_interval: 60s
+
+fan:
+  - platform: speed
+    id: purifier
+    name: "Air Purifier"
+    output: dummy_fan_output
+    speed_count: 3
+    on_turn_on:
+      # HA may send a bare "on" with no speed, in which case speed can be 0.
+      - lambda: |-
+          if (id(syncing)) return;
+          int s = id(purifier).speed;
+          id(desired_speed) = s < 1 ? 1 : s;
+          id(give_up_target) = -1;
+      - script.execute: go_to_speed
+    on_turn_off:
+      - lambda: |-
+          if (id(syncing)) return;
+          id(desired_speed) = 0;
+          id(give_up_target) = -1;
+      - script.execute: go_to_speed
+    on_speed_set:
+      - lambda: |-
+          if (id(syncing)) return;
+          int s = id(purifier).speed;
+          id(desired_speed) = s < 1 ? 1 : s;
+          id(give_up_target) = -1;
+      - script.execute: go_to_speed
+
+# Watchdog. script.execute is silently dropped while go_to_speed is running,
+# so a command arriving just before the loop exits would be lost otherwise.
+interval:
+  - interval: 2s
+    then:
+      - if:
+          condition:
+            lambda: |-
+              return !id(adjusting) && !id(script_running)
+                     && id(current_speed) != id(desired_speed)
+                     && id(desired_speed) != id(give_up_target);
+          then:
+            - script.execute: go_to_speed
+
+button:
+  # Calibration helper: press the purifier button from HA and watch "LED1 duty".
+  - platform: template
+    name: "Press purifier button"
+    entity_category: config
+    on_press:
+      - script.execute: press_once
+  - platform: restart
+    name: "Restart"

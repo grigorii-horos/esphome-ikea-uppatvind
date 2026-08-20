@@ -1,6 +1,8 @@
 # ESPHome + Ikea UPPÅTVIND
 
 > See also [horvathgergo/esp8266-for-uppatvind](https://github.com/horvathgergo/esp8266-for-uppatvind) which is a project to replace the board in the UPPÅTVIND with a custom board powered by an ESP866.
+>
+> See also [`esp32-c3/`](esp32-c3/) in this repo for an ESP32-C3 variant that exposes the purifier as a single Home Assistant `fan` entity, with calibrated speed detection, two-way state sync and long-press power off.
 
 ## Overview
 
