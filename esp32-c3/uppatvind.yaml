@@ -126,6 +126,17 @@ globals:
   - id: press_budget
     type: int
     initial_value: "0"
+  # Until LED1 has been read once, we do not know what the hardware is doing —
+  # current_speed is still just its initial zero. The fan entity restores its
+  # previous state on boot and fires on_turn_on, and without this flag the
+  # script counted presses from zero: at speed 2 that meant 2->3->0, i.e. it
+  # switched the purifier off, and the retry then brought it back. Four stray
+  # presses and 4 s of "off" after every reboot — and a reboot happens on its
+  # own after 15 min without WiFi (wifi reboot_timeout), e.g. when the router
+  # restarts.
+  - id: sensor_ready
+    type: bool
+    initial_value: "false"
 
 script:
   # A single press, exposed to HA for calibration.
@@ -150,10 +161,17 @@ script:
     mode: single
     then:
       - lambda: "id(retries) = 0; id(script_running) = true;"
+      # Never press anything before we know the real state of the hardware.
+      - wait_until:
+          condition:
+            lambda: "return id(sensor_ready);"
+          timeout: 15s
       - while:
           condition:
             lambda: |-
-              return id(current_speed) != id(desired_speed) && id(retries) < 3;
+              return id(sensor_ready)
+                     && id(current_speed) != id(desired_speed)
+                     && id(retries) < 3;
           then:
             - lambda: |-
                 id(adjusting) = true;
@@ -261,6 +279,21 @@ sensor:
               id(pending_count) += 1;
               return;
             }
+            if (!id(sensor_ready)) {
+              // First confirmed reading after boot. The hardware wins: the
+              // purifier outlived the controller reboot, so its state is the
+              // truth and the state the fan entity restored is discarded.
+              id(sensor_ready) = true;
+              id(current_speed) = spd;
+              id(desired_speed) = spd;
+              id(syncing) = true;
+              auto boot_call = id(purifier).make_call();
+              if (spd == 0) boot_call.set_state(false);
+              else { boot_call.set_state(true); boot_call.set_speed(spd); }
+              boot_call.perform();
+              id(syncing) = false;
+              return;
+            }
             if (spd == id(current_speed)) return;
             id(current_speed) = spd;
             // Someone pressed the physical button: follow the hardware.
@@ -318,7 +351,7 @@ interval:
       - if:
           condition:
             lambda: |-
-              return !id(adjusting) && !id(script_running)
+              return id(sensor_ready) && !id(adjusting) && !id(script_running)
                      && id(current_speed) != id(desired_speed)
                      && id(desired_speed) != id(give_up_target);
           then:

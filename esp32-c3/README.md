@@ -101,6 +101,15 @@ those two honest:
 - **A 2 s watchdog.** `script.execute` is dropped while the script runs, so a
   command arriving just before the loop exits would be lost. The watchdog
   restarts the script whenever target and actual disagree.
+- **Nothing is pressed before the hardware has been read.** The fan entity
+  restores its previous state on boot and fires `on_turn_on` while
+  `current_speed` is still its initial zero. Counting presses from zero meant
+  that at speed 2 the sequence went 2 → 3 → 0, switching the purifier off, and
+  the retry then brought it back: four stray presses and 4 s of "off" after
+  every reboot. Since a reboot happens on its own after 15 minutes without
+  WiFi, a router restart was enough to trigger it. The first confirmed LED1
+  reading now sets the target to the actual speed and unblocks the script —
+  the purifier outlived the controller reboot, so its state is the truth.
 - **Failure is visible.** After three failed attempts the UI rolls back to the
   actual speed rather than lying about a state the hardware never reached.
 
